@@ -1,4 +1,4 @@
-## **🚀 Distributed Job Queue with SQL-Backed Coordination**
+## 🚀 Distributed Job Queue with SQL-Backed Coordination
 A production-grade distributed background job processing system built on PostgreSQL with exactly-once execution, fault tolerance, retries, scheduling, metrics, and Kubernetes deployment.
 
 This system is inspired by architectures used at Amazon, Stripe, Uber, and Airbnb for asynchronous workflows.
