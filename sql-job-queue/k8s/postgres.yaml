@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: job-queue
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16
+        env:
+        - name: POSTGRES_USER
+          value: queue
+        - name: POSTGRES_PASSWORD
+          value: queue
+        - name: POSTGRES_DB
+          value: queue_db
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi

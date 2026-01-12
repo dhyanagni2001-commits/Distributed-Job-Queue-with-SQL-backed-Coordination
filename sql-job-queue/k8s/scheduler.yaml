@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: job-scheduler
+  namespace: job-queue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: job-scheduler
+  template:
+    metadata:
+      labels:
+        app: job-scheduler
+    spec:
+      containers:
+      - name: scheduler
+        image: sql-job-queue-scheduler:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DATABASE_URL
+          value: postgresql://queue:queue@postgres:5432/queue_db
+        - name: SCHEDULER_POLL_SECONDS
+          value: "5"

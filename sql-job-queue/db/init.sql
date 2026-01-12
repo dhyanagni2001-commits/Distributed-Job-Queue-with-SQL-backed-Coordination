@@ -48,3 +48,29 @@ DROP TRIGGER IF EXISTS trg_touch_updated ON jobs;
 CREATE TRIGGER trg_touch_updated
 BEFORE UPDATE ON jobs
 FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+
+-- ================================
+-- Priority Queue Support
+-- ================================
+
+ALTER TABLE jobs
+ADD COLUMN IF NOT EXISTS queue TEXT NOT NULL DEFAULT 'default';
+
+-- Optimized pick index for distributed workers
+DROP INDEX IF EXISTS idx_jobs_pick;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_pick
+ON jobs (status, queue, run_after, priority DESC, created_at);
+
+
+-- ================================
+-- Distributed Rate Limiter Table
+-- ================================
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+  key TEXT PRIMARY KEY,
+  window_start TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  count INT NOT NULL
+);
+

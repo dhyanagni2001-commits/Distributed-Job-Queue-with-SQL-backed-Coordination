@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: job-worker
+  namespace: job-queue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: job-worker
+  template:
+    metadata:
+      labels:
+        app: job-worker
+    spec:
+      containers:
+      - name: worker
+        image: sql-job-queue-worker:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DATABASE_URL
+          value: postgresql://queue:queue@postgres:5432/queue_db
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 5"]

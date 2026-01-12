@@ -1,194 +1,263 @@
 import os
 import time
-import random
-from datetime import datetime, timedelta, timezone
+import json
+import signal
+import socket
+from datetime import datetime, timezone, timedelta
+
+from psycopg import OperationalError
+from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, push_to_gateway
+
 from db import get_conn
 
-# ================= CONFIG =================
-
-WORKER_ID = os.getenv("WORKER_ID", "worker-1")
+# -----------------------------
+# Config
+# -----------------------------
+WORKER_ID = os.getenv("WORKER_ID", socket.gethostname())
+QUEUE = os.getenv("QUEUE", "default")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 POLL_INTERVAL_MS = int(os.getenv("POLL_INTERVAL_MS", "500"))
 LEASE_SECONDS = int(os.getenv("LEASE_SECONDS", "60"))
-MAX_ATTEMPTS_DEFAULT = int(os.getenv("MAX_ATTEMPTS", "5"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5"))
 
-# ================= UTILS =================
+PUSHGATEWAY_URL = os.getenv("PUSHGATEWAY_URL")  # e.g. http://pushgateway:9091 (optional)
 
-def utcnow():
-    return datetime.now(timezone.utc)
+# -----------------------------
+# Prometheus (pushgateway)
+# -----------------------------
+REGISTRY = CollectorRegistry()
 
-# ================= CRASH RECOVERY =================
+W_POLL_LOOPS = Counter("worker_poll_loops_total", "Worker poll loops", ["worker_id"], registry=REGISTRY)
+W_JOBS_LOCKED = Counter("worker_jobs_locked_total", "Jobs locked by worker", ["worker_id", "queue"], registry=REGISTRY)
+W_JOBS_DONE = Counter("worker_jobs_completed_total", "Jobs completed by worker", ["worker_id", "queue"], registry=REGISTRY)
+W_JOBS_FAIL = Counter("worker_jobs_failed_total", "Jobs failed by worker", ["worker_id", "queue"], registry=REGISTRY)
+W_INFLIGHT = Gauge("worker_inflight", "Jobs in-flight", ["worker_id", "queue"], registry=REGISTRY)
+W_JOB_TIME = Histogram("worker_job_duration_seconds", "Job execution duration", ["job_type"], registry=REGISTRY)
+W_DB_ERRORS = Counter("worker_db_errors_total", "DB errors", ["worker_id"], registry=REGISTRY)
 
-def reclaim_stale_locks(conn):
+def push_metrics():
+    if not PUSHGATEWAY_URL:
+        return
+    try:
+        push_to_gateway(PUSHGATEWAY_URL, job="sql_job_queue_worker", registry=REGISTRY)
+    except Exception:
+        # metrics must never crash worker
+        pass
+
+# -----------------------------
+# Graceful shutdown
+# -----------------------------
+STOP = False
+
+def handle_signal(signum, frame):
+    global STOP
+    STOP = True
+    print(f"[worker] received signal {signum}, shutting down...")
+
+signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
+
+# -----------------------------
+# Job Handlers
+# -----------------------------
+def handle_job(job: dict):
     """
-    If a worker crashes while holding a job lock,
-    reclaim it after lease timeout.
+    Implement job types here.
+    This is where you add real tasks: email send, video encode, scraping, ML inference, etc.
     """
-    lease_deadline = utcnow() - timedelta(seconds=LEASE_SECONDS)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE jobs
-            SET status='PENDING', locked_by=NULL, locked_at=NULL
-            WHERE status='RUNNING' AND locked_at < %s
-            """,
-            (lease_deadline,),
-        )
-
-# ================= JOB FINALIZATION =================
-
-def complete_job(conn, job_id):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE jobs
-            SET status='COMPLETED',
-                locked_by=NULL,
-                locked_at=NULL,
-                last_error=NULL
-            WHERE id=%s
-            """,
-            (job_id,),
-        )
-
-def fail_job(conn, job_id, err, attempts, max_attempts):
-    """
-    Retry with exponential backoff.
-    After max attempts → DEAD queue.
-    """
-    backoff = min(300, (2 ** min(attempts, 8))) + random.randint(0, 3)
-    run_after = utcnow() + timedelta(seconds=backoff)
-
-    new_status = "PENDING" if attempts < max_attempts else "DEAD"
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE jobs
-            SET status=%s,
-                attempts=%s,
-                run_after=%s,
-                locked_by=NULL,
-                locked_at=NULL,
-                last_error=%s
-            WHERE id=%s
-            """,
-            (new_status, attempts, run_after, err[:2000], job_id),
-        )
-
-# ================= JOB HANDLERS =================
-
-def handle_job(job):
-    """
-    Plug your real business logic here.
-    """
-
     job_type = job["type"]
-    payload = job["payload"]
+    payload = job.get("payload") or {}
 
-    # Demo: sleep job
     if job_type == "demo.sleep":
         seconds = int(payload.get("seconds", 1))
         time.sleep(seconds)
         return
 
-    # Demo: flaky job (random failure)
-    if job_type == "demo.flaky":
-        if random.random() < 0.6:
-            raise RuntimeError("Random failure (demo.flaky)")
-        return
-
+    # Unknown job type -> fail (worker marks FAILED/DEAD accordingly)
     raise RuntimeError(f"Unknown job type: {job_type}")
 
-# ================= WORKER LOOP =================
+# -----------------------------
+# DB Operations
+# -----------------------------
+def now_utc():
+    return datetime.now(timezone.utc)
 
+def reclaim_stale_leases(conn):
+    """
+    If a worker died while holding a lock, reclaim jobs whose locked_at is too old.
+    """
+    lease_cutoff = now_utc() - timedelta(seconds=LEASE_SECONDS)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs
+            SET status='PENDING', locked_by=NULL, locked_at=NULL
+            WHERE status='RUNNING'
+              AND locked_at IS NOT NULL
+              AND locked_at < %s
+            """,
+            (lease_cutoff,),
+        )
+
+def pick_jobs(conn):
+    """
+    Pick jobs safely using row locks:
+    - only PENDING
+    - only our QUEUE
+    - only due jobs
+    - priority DESC, FIFO
+    - SKIP LOCKED for multi-worker concurrency
+    """
+    with conn.cursor() as cur:
+        cur.execute("BEGIN;")
+
+        # Reclaim stale locks occasionally (cheap and safe)
+        reclaim_stale_leases(conn)
+
+        cur.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE status='PENDING'
+              AND queue = %s
+              AND run_after <= NOW()
+            ORDER BY priority DESC, created_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+            """,
+            (QUEUE, BATCH_SIZE),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            cur.execute("COMMIT;")
+            return []
+
+        job_ids = [r["id"] for r in rows]
+
+        cur.execute(
+            """
+            UPDATE jobs
+            SET status='RUNNING',
+                locked_by=%s,
+                locked_at=NOW()
+            WHERE id = ANY(%s)
+            """,
+            (WORKER_ID, job_ids),
+        )
+
+        cur.execute("COMMIT;")
+        return [dict(r) for r in rows]
+
+def mark_completed(conn, job_id):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs
+            SET status='COMPLETED', locked_by=NULL, locked_at=NULL
+            WHERE id=%s
+            """,
+            (job_id,),
+        )
+
+def backoff_seconds(attempts: int) -> int:
+    # exponential backoff with cap
+    return min(2 ** attempts, 60)
+
+def mark_failed(conn, job: dict, err: str):
+    """
+    If attempts < max_attempts -> FAILED and schedule retry
+    Else -> DEAD
+    """
+    attempts = int(job["attempts"])
+    max_attempts = int(job["max_attempts"])
+    new_attempts = attempts + 1
+
+    with conn.cursor() as cur:
+        if new_attempts >= max_attempts:
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status='DEAD',
+                    attempts=%s,
+                    last_error=%s,
+                    locked_by=NULL,
+                    locked_at=NULL
+                WHERE id=%s
+                """,
+                (new_attempts, err, job["id"]),
+            )
+        else:
+            delay = backoff_seconds(new_attempts)
+            run_after = now_utc() + timedelta(seconds=delay)
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status='FAILED',
+                    attempts=%s,
+                    last_error=%s,
+                    run_after=%s,
+                    locked_by=NULL,
+                    locked_at=NULL
+                WHERE id=%s
+                """,
+                (new_attempts, err, run_after, job["id"]),
+            )
+
+def is_cancelled(conn, job_id) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT status FROM jobs WHERE id=%s", (job_id,))
+        row = cur.fetchone()
+        return row and row["status"] == "CANCELLED"
+
+# -----------------------------
+# Main Loop
+# -----------------------------
 def main():
-    print(f"[{WORKER_ID}] worker started, polling for jobs...")
+    print(f"[worker] started worker_id={WORKER_ID} queue={QUEUE} batch={BATCH_SIZE}")
 
-    while True:
+    while not STOP:
+        W_POLL_LOOPS.labels(worker_id=WORKER_ID).inc()
+
         try:
-            print(f"[{WORKER_ID}] polling for jobs...")
-
             with get_conn() as conn:
-                with conn.cursor() as cur:
+                jobs = pick_jobs(conn)
+                if not jobs:
+                    push_metrics()
+                    time.sleep(POLL_INTERVAL_MS / 1000.0)
+                    continue
 
-                    # Recover jobs from crashed workers
-                    reclaim_stale_locks(conn)
+                W_JOBS_LOCKED.labels(worker_id=WORKER_ID, queue=QUEUE).inc(len(jobs))
 
-                    # Start transaction
-                    cur.execute("BEGIN;")
-
-                    # Pick jobs with row locking
-                    cur.execute(
-                        """
-                        SELECT id
-                        FROM jobs
-                        WHERE status='PENDING'
-                          AND run_after <= NOW()
-                        ORDER BY priority DESC, created_at
-                        FOR UPDATE SKIP LOCKED
-                        LIMIT %s
-                        """,
-                        (BATCH_SIZE,),
-                    )
-
-                    rows = cur.fetchall()
-
-                    if not rows:
-                        cur.execute("COMMIT;")
-                        time.sleep(POLL_INTERVAL_MS / 1000)
+                for job in jobs:
+                    # Skip if job cancelled after lock (rare but possible)
+                    if is_cancelled(conn, job["id"]):
                         continue
 
-                    ids = [r["id"] for r in rows]
+                    W_INFLIGHT.labels(worker_id=WORKER_ID, queue=QUEUE).inc()
+                    t0 = time.time()
 
-                    # Mark jobs as RUNNING
-                    cur.execute(
-                        """
-                        UPDATE jobs
-                        SET status='RUNNING',
-                            locked_by=%s,
-                            locked_at=NOW()
-                        WHERE id = ANY(%s)
-                        RETURNING *;
-                        """,
-                        (WORKER_ID, ids),
-                    )
+                    try:
+                        handle_job(job)
+                        mark_completed(conn, job["id"])
+                        W_JOBS_DONE.labels(worker_id=WORKER_ID, queue=QUEUE).inc()
+                    except Exception as e:
+                        err = str(e)
+                        mark_failed(conn, job, err)
+                        W_JOBS_FAIL.labels(worker_id=WORKER_ID, queue=QUEUE).inc()
+                    finally:
+                        W_JOB_TIME.labels(job_type=job["type"]).observe(time.time() - t0)
+                        W_INFLIGHT.labels(worker_id=WORKER_ID, queue=QUEUE).dec()
+                        push_metrics()
 
-                    jobs = cur.fetchall()
+        except OperationalError as e:
+            W_DB_ERRORS.labels(worker_id=WORKER_ID).inc()
+            print("[worker] db error:", e)
+            time.sleep(1)
+        except Exception as e:
+            print("[worker] unexpected error:", e)
+            time.sleep(1)
 
-                    # Commit transaction
-                    cur.execute("COMMIT;")
-
-            # Execute jobs outside DB transaction
-            for job in jobs:
-                job_id = job["id"]
-                attempts = int(job["attempts"])
-                max_attempts = int(job.get("max_attempts") or MAX_ATTEMPTS_DEFAULT)
-
-                try:
-                    print(f"[{WORKER_ID}] RUN {job_id} type={job['type']} attempts={attempts}")
-
-                    handle_job(job)
-
-                    with get_conn() as conn2:
-                        complete_job(conn2, job_id)
-
-                    print(f"[{WORKER_ID}] DONE {job_id}")
-
-                except Exception as e:
-                    attempts += 1
-
-                    with get_conn() as conn2:
-                        fail_job(conn2, job_id, str(e), attempts, max_attempts)
-
-                    print(f"[{WORKER_ID}] FAIL {job_id} attempts={attempts} err={e}")
-
-        except Exception as outer:
-            print(f"[{WORKER_ID}] WORKER LOOP ERROR: {outer}")
-            time.sleep(2)
-
-# ================= ENTRYPOINT =================
+    print("[worker] stopped cleanly")
 
 if __name__ == "__main__":
     main()
